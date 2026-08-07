@@ -8,7 +8,7 @@ import (
 
 func main() {
 	node := maelstrom.NewNode()
-	kv := maelstrom.NewSeqKV(node)
+	handlers(node)
 
 	if err := node.Run(); err != nil {
 		log.Fatal(err)

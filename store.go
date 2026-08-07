@@ -1,14 +1,13 @@
 package main
 
 import (
-	"fmt"
-	"strconv"
 	"sync"
 )
 
 type safeLogger struct {
 	loggerLock sync.RWMutex
 	keyStores  map[string]keyStores
+	committed  map[string]int
 }
 
 type keyStores struct {
@@ -21,29 +20,66 @@ type message struct {
 	offset      int
 }
 
-func (sL *safeLogger) Add(key string, value int) (int, error) {
+func newSafeLogger() *safeLogger {
+	return &safeLogger{
+		keyStores: make(map[string]keyStores),
+		committed: make(map[string]int),
+	}
+}
+
+func (sL *safeLogger) Add(key string, value int) int {
 	sL.loggerLock.Lock()
 	defer sL.loggerLock.Unlock()
 
-	keyStore, ok := sL.keyStores[key]
-	slicedKey := key[1:]
+	keyStore := sL.keyStores[key]
+	offset := keyStore.offsets
 
-	offsettBase, err := strconv.Atoi(slicedKey)
-	if err != nil {
-		fmt.Println("Conversion error:", err)
-		return 0, err
+	keyStore.messages = append(keyStore.messages, message{
+		offset:      offset,
+		messageSent: value,
+	})
+	keyStore.offsets++
+	sL.keyStores[key] = keyStore
+
+	return offset
+}
+
+func (sL *safeLogger) Poll(offsets map[string]int) map[string][][]int {
+	sL.loggerLock.RLock()
+	defer sL.loggerLock.RUnlock()
+
+	result := make(map[string][][]int, len(offsets))
+	for key, requestedOffset := range offsets {
+		result[key] = make([][]int, 0)
+		for _, storedMessage := range sL.keyStores[key].messages {
+			if storedMessage.offset >= requestedOffset {
+				result[key] = append(result[key], []int{storedMessage.offset, storedMessage.messageSent})
+			}
+		}
 	}
 
-	// If map is empty
-	if !ok {
-		newStore := keyStores{messages: []message{message{offset: offsettBase * 1000, messageSent: value}}, offsets: offsettBase * 1000}
-		sL.keyStores[key] = newStore
-		return 0, nil
+	return result
+}
+
+func (sL *safeLogger) CommitOffsets(offsets map[string]int) {
+	sL.loggerLock.Lock()
+	defer sL.loggerLock.Unlock()
+
+	for key, offset := range offsets {
+		sL.committed[key] = offset
+	}
+}
+
+func (sL *safeLogger) ListCommittedOffsets(keys []string) map[string]int {
+	sL.loggerLock.RLock()
+	defer sL.loggerLock.RUnlock()
+
+	result := make(map[string]int, len(keys))
+	for _, key := range keys {
+		if offset, exists := sL.committed[key]; exists {
+			result[key] = offset
+		}
 	}
 
-	offset := keyStore.offsets + 1
-	keyStore.messages = append(keyStore.messages, message{offset: offset + 1, messageSent: value})
-	keyStore.offsets = offset
-
-	return offset, nil
+	return result
 }
