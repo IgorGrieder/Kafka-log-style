@@ -3,26 +3,27 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
+const forwardTimeout = 5 * time.Second
+
 func handlers(node *maelstrom.Node) {
-	store := newKafkaStore(maelstrom.NewLinKV(node))
+	store := newKafkaStore()
 
 	node.Handle("send", func(msg maelstrom.Message) error {
 		var body sendRequest
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
-
-		offset, err := store.Add(context.Background(), body.Key, body.Msg)
-		if err != nil {
-			return err
+		if shouldForward(node) {
+			return forwardRequest(node, msg, body)
 		}
 
-		response := &sendResponse{MessageType: "send_ok", Offset: offset}
-		return node.Reply(msg, response)
+		offset := store.Add(body.Key, body.Msg)
+		return node.Reply(msg, &sendResponse{MessageType: "send_ok", Offset: offset})
 	})
 
 	node.Handle("poll", func(msg maelstrom.Message) error {
@@ -30,14 +31,13 @@ func handlers(node *maelstrom.Node) {
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
-
-		messages, err := store.Poll(context.Background(), body.Offsets)
-		if err != nil {
-			return err
+		if shouldForward(node) {
+			return forwardRequest(node, msg, body)
 		}
+
 		response := &pollResponse{
 			MessageType: "poll_ok",
-			Messages:    messages,
+			Messages:    store.Poll(body.Offsets),
 		}
 		return node.Reply(msg, response)
 	})
@@ -47,10 +47,11 @@ func handlers(node *maelstrom.Node) {
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
-
-		if err := store.CommitOffsets(context.Background(), body.Offsets); err != nil {
-			return err
+		if shouldForward(node) {
+			return forwardRequest(node, msg, body)
 		}
+
+		store.CommitOffsets(body.Offsets)
 		return node.Reply(msg, &commitOffsetsResponse{MessageType: "commit_offsets_ok"})
 	})
 
@@ -59,15 +60,44 @@ func handlers(node *maelstrom.Node) {
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
-
-		offsets, err := store.ListCommittedOffsets(context.Background(), body.Keys)
-		if err != nil {
-			return err
+		if shouldForward(node) {
+			return forwardRequest(node, msg, body)
 		}
+
 		response := &listCommittedOffsetsResponse{
 			MessageType: "list_committed_offsets_ok",
-			Offsets:     offsets,
+			Offsets:     store.ListCommittedOffsets(body.Keys),
 		}
 		return node.Reply(msg, response)
 	})
+}
+
+func shouldForward(node *maelstrom.Node) bool {
+	return node.ID() != ownerNode(node)
+}
+
+func ownerNode(node *maelstrom.Node) string {
+	nodeIDs := node.NodeIDs()
+	if len(nodeIDs) == 0 {
+		return node.ID()
+	}
+
+	owner := nodeIDs[0]
+	for _, nodeID := range nodeIDs[1:] {
+		if nodeID < owner {
+			owner = nodeID
+		}
+	}
+	return owner
+}
+
+func forwardRequest(node *maelstrom.Node, original maelstrom.Message, body any) error {
+	ctx, cancel := context.WithTimeout(context.Background(), forwardTimeout)
+	defer cancel()
+
+	response, err := node.SyncRPC(ctx, ownerNode(node), body)
+	if err != nil {
+		return err
+	}
+	return node.Reply(original, json.RawMessage(response.Body))
 }
