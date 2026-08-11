@@ -1,13 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
 func handlers(node *maelstrom.Node) {
-	store := newSafeLogger()
+	store := newKafkaStore(maelstrom.NewLinKV(node))
 
 	node.Handle("send", func(msg maelstrom.Message) error {
 		var body sendRequest
@@ -15,7 +16,10 @@ func handlers(node *maelstrom.Node) {
 			return err
 		}
 
-		offset := store.Add(body.Key, body.Msg)
+		offset, err := store.Add(context.Background(), body.Key, body.Msg)
+		if err != nil {
+			return err
+		}
 
 		response := &sendResponse{MessageType: "send_ok", Offset: offset}
 		return node.Reply(msg, response)
@@ -27,9 +31,13 @@ func handlers(node *maelstrom.Node) {
 			return err
 		}
 
+		messages, err := store.Poll(context.Background(), body.Offsets)
+		if err != nil {
+			return err
+		}
 		response := &pollResponse{
 			MessageType: "poll_ok",
-			Messages:    store.Poll(body.Offsets),
+			Messages:    messages,
 		}
 		return node.Reply(msg, response)
 	})
@@ -40,7 +48,9 @@ func handlers(node *maelstrom.Node) {
 			return err
 		}
 
-		store.CommitOffsets(body.Offsets)
+		if err := store.CommitOffsets(context.Background(), body.Offsets); err != nil {
+			return err
+		}
 		return node.Reply(msg, &commitOffsetsResponse{MessageType: "commit_offsets_ok"})
 	})
 
@@ -50,9 +60,13 @@ func handlers(node *maelstrom.Node) {
 			return err
 		}
 
+		offsets, err := store.ListCommittedOffsets(context.Background(), body.Keys)
+		if err != nil {
+			return err
+		}
 		response := &listCommittedOffsetsResponse{
 			MessageType: "list_committed_offsets_ok",
-			Offsets:     store.ListCommittedOffsets(body.Keys),
+			Offsets:     offsets,
 		}
 		return node.Reply(msg, response)
 	})

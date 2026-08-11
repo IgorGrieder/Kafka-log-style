@@ -1,85 +1,114 @@
 package main
 
 import (
-	"sync"
+	"context"
+	"errors"
+	"fmt"
+
+	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-type safeLogger struct {
-	loggerLock sync.RWMutex
-	keyStores  map[string]keyStores
-	committed  map[string]int
+const (
+	logKeyPrefix       = "log/"
+	committedKeyPrefix = "committed/"
+)
+
+type keyValueStore interface {
+	ReadInto(context.Context, string, any) error
+	Write(context.Context, string, any) error
+	CompareAndSwap(context.Context, string, any, any, bool) error
 }
 
-type keyStores struct {
-	messages []message
-	offsets  int
+type kafkaStore struct {
+	kv keyValueStore
 }
 
-type message struct {
-	messageSent int
-	offset      int
+func newKafkaStore(kv keyValueStore) *kafkaStore {
+	return &kafkaStore{kv: kv}
 }
 
-func newSafeLogger() *safeLogger {
-	return &safeLogger{
-		keyStores: make(map[string]keyStores),
-		committed: make(map[string]int),
+func (s *kafkaStore) Add(ctx context.Context, key string, value int) (int, error) {
+	storageKey := logKeyPrefix + key
+
+	for {
+		var messages [][]int
+		err := s.kv.ReadInto(ctx, storageKey, &messages)
+
+		var previous any = messages
+		if isRPCError(err, maelstrom.KeyDoesNotExist) {
+			messages = make([][]int, 0)
+			previous = nil
+		} else if err != nil {
+			return 0, fmt.Errorf("read log %q: %w", key, err)
+		}
+
+		offset := len(messages)
+		updated := append(append([][]int(nil), messages...), []int{offset, value})
+		err = s.kv.CompareAndSwap(ctx, storageKey, previous, updated, true)
+		if isRPCError(err, maelstrom.PreconditionFailed) {
+			continue
+		}
+		if err != nil {
+			return 0, fmt.Errorf("append to log %q: %w", key, err)
+		}
+
+		return offset, nil
 	}
 }
 
-func (sL *safeLogger) Add(key string, value int) int {
-	sL.loggerLock.Lock()
-	defer sL.loggerLock.Unlock()
-
-	keyStore := sL.keyStores[key]
-	offset := keyStore.offsets
-
-	keyStore.messages = append(keyStore.messages, message{
-		offset:      offset,
-		messageSent: value,
-	})
-	keyStore.offsets++
-	sL.keyStores[key] = keyStore
-
-	return offset
-}
-
-func (sL *safeLogger) Poll(offsets map[string]int) map[string][][]int {
-	sL.loggerLock.RLock()
-	defer sL.loggerLock.RUnlock()
-
+func (s *kafkaStore) Poll(ctx context.Context, offsets map[string]int) (map[string][][]int, error) {
 	result := make(map[string][][]int, len(offsets))
+
 	for key, requestedOffset := range offsets {
+		var messages [][]int
+		err := s.kv.ReadInto(ctx, logKeyPrefix+key, &messages)
+		if isRPCError(err, maelstrom.KeyDoesNotExist) {
+			result[key] = make([][]int, 0)
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read log %q: %w", key, err)
+		}
+
 		result[key] = make([][]int, 0)
-		for _, storedMessage := range sL.keyStores[key].messages {
-			if storedMessage.offset >= requestedOffset {
-				result[key] = append(result[key], []int{storedMessage.offset, storedMessage.messageSent})
+		for _, message := range messages {
+			if message[0] >= requestedOffset {
+				result[key] = append(result[key], message)
 			}
 		}
 	}
 
-	return result
+	return result, nil
 }
 
-func (sL *safeLogger) CommitOffsets(offsets map[string]int) {
-	sL.loggerLock.Lock()
-	defer sL.loggerLock.Unlock()
-
+func (s *kafkaStore) CommitOffsets(ctx context.Context, offsets map[string]int) error {
 	for key, offset := range offsets {
-		sL.committed[key] = offset
-	}
-}
-
-func (sL *safeLogger) ListCommittedOffsets(keys []string) map[string]int {
-	sL.loggerLock.RLock()
-	defer sL.loggerLock.RUnlock()
-
-	result := make(map[string]int, len(keys))
-	for _, key := range keys {
-		if offset, exists := sL.committed[key]; exists {
-			result[key] = offset
+		if err := s.kv.Write(ctx, committedKeyPrefix+key, offset); err != nil {
+			return fmt.Errorf("commit offset for %q: %w", key, err)
 		}
 	}
+	return nil
+}
 
-	return result
+func (s *kafkaStore) ListCommittedOffsets(ctx context.Context, keys []string) (map[string]int, error) {
+	result := make(map[string]int, len(keys))
+
+	for _, key := range keys {
+		var offset int
+		err := s.kv.ReadInto(ctx, committedKeyPrefix+key, &offset)
+		if isRPCError(err, maelstrom.KeyDoesNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read committed offset for %q: %w", key, err)
+		}
+		result[key] = offset
+	}
+
+	return result, nil
+}
+
+func isRPCError(err error, code int) bool {
+	var rpcErr *maelstrom.RPCError
+	return errors.As(err, &rpcErr) && rpcErr.Code == code
 }
